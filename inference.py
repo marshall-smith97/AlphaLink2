@@ -4,6 +4,7 @@ import logging
 import math
 import numpy as np
 import os
+import pandas as pd
 
 import time
 import torch
@@ -88,9 +89,23 @@ def load_feature_for_one_target(
     )
     batch = UnifoldDataset.collater([batch])
     return batch
-
+def load_rdc_file(path):
+    """Load a tab-delimited RDC file with columns: residue, atom1, atom2, value."""
+    try:
+        df = pd.read_csv(path, sep="\t", header=None, names=["residue", "atom1", "atom2", "value"])
+        return df
+    except Exception as e:
+        raise ValueError(f"Failed to read RDC file: {path}\n{e}")
 
 def main(args):
+    rdc_df = None
+    use_rdcs = args.rdc_path is not None
+    if use_rdcs:
+        try:
+            print(f"Loading RDCs from {args.rdc_path}")
+            rdc_df = load_rdc_file(args.rdc_path)
+        except Exception as e:
+            raise ValueError(f"Failed to read RDC file: {args.rdc_path}\n{e}")
     config = model_config(args.model_name)
     config.data.common.max_recycling_iters = args.max_recycling_iters
     config.globals.max_recycling_iters = args.max_recycling_iters
@@ -198,23 +213,76 @@ def main(args):
 
         ca_idx = rc.atom_order["CA"]
         ca_coords = torch.from_numpy(out["final_atom_positions"][..., ca_idx, :])
-
-        distances = get_pairwise_distances(ca_coords)#[0]#[0,0]
-
-        xl = torch.from_numpy(batch['xl'][...,0] > 0)
         
-        interface = torch.from_numpy(batch['asym_id'][..., None] != batch['asym_id'][..., None, :])
+        if rdc_df is not None:
+            # Use RDC Q-factor as selection metric
+            def compute_q_factor(pred_coords, rdc_df):
+                # Simplified: assumes atom1/atom2 are always N/H or other valid single-atom types
+                coords_np = pred_coords.detach().cpu().numpy()
+                diffs = []
+                values = []
+                for _, row in rdc_df.iterrows():
+                    res_idx = int(row["residue"]) - 1  # assuming 1-based indexing in file
+                    atom1 = row["atom1"]
+                    atom2 = row["atom2"]
+                    try:
+                        a1_idx = rc.atom_order[atom1]
+                        a2_idx = rc.atom_order[atom2]
+                        vec = coords_np[res_idx, a2_idx] - coords_np[res_idx, a1_idx]
+                        angle = vec[2] / np.linalg.norm(vec)  # assume alignment along z
+                        pred_rdc = angle**2  # simple dipolar model (scaled out)
+                        diffs.append(pred_rdc - row["value"])
+                        values.append(row["value"])
+                    except Exception as e:
+                        continue  # skip invalid atoms or missing values
+                diffs = np.array(diffs)
+                values = np.array(values)
+                if len(values) == 0:
+                    return np.inf  # prevent selecting if no RDCs match
+                q = np.sqrt(np.mean(diffs**2)) / np.sqrt(np.mean(values**2))
+                return q
+        
+            q_score = compute_q_factor(out["final_atom_positions"][..., :], rdc_df)
+            print(f"Model {it} RDC Q factor: {q_score:.4f} Model confidence: {np.mean(out['iptm+ptm']):.3f}")
+        
+            if best_out is None or q_score < best_q_score:
+                best_q_score = q_score
+                best_out = out
+                best_seed = cur_seed
+        
+        else:
+            distances = get_pairwise_distances(ca_coords)
+            xl = torch.from_numpy(batch['xl'][...,0] > 0)
+            interface = torch.from_numpy(batch['asym_id'][..., None] != batch['asym_id'][..., None, :])
+            satisfied = torch.sum(distances[xl & interface] <= args.cutoff) / 2
+            total_xl = torch.sum(xl & interface) / 2
+            print("Model %d Crosslink satisfaction: %.3f Model confidence: %.3f" % (it, satisfied / total_xl, np.mean(out["iptm+ptm"])))
+        
+            if best_out is None or np.mean(out["iptm+ptm"]) > best_iptm:
+                best_iptm = np.mean(out["iptm+ptm"])
+                best_out = out
+                best_seed = cur_seed
+        
 
-        satisfied = torch.sum(distances[xl & interface] <= args.cutoff) / 2
 
-        total_xl = torch.sum(xl & interface) / 2
 
-        if np.mean(out["iptm+ptm"]) > best_iptm:
-            best_iptm = np.mean(out["iptm+ptm"])
-            best_out = out
-            best_seed = cur_seed
+#         distances = get_pairwise_distances(ca_coords)#[0]#[0,0]
+# 	# We may be add the RDCs here as a selection criteria
+        
+#         xl = torch.from_numpy(batch['xl'][...,0] > 0)
+        
+#         interface = torch.from_numpy(batch['asym_id'][..., None] != batch['asym_id'][..., None, :])
 
-        print("Model %d Crosslink satisfaction: %.3f Model confidence: %.3f" %(it,satisfied / total_xl, np.mean(out["iptm+ptm"])))
+#         satisfied = torch.sum(distances[xl & interface] <= args.cutoff) / 2
+
+#         total_xl = torch.sum(xl & interface) / 2
+
+#         if np.mean(out["iptm+ptm"]) > best_iptm:
+#             best_iptm = np.mean(out["iptm+ptm"])
+#             best_out = out
+#             best_seed = cur_seed
+
+#         print("Model %d Crosslink satisfaction: %.3f Model confidence: %.3f" %(it,satisfied / total_xl, np.mean(out["iptm+ptm"])))
 
         plddt = out["plddt"]
         mean_plddt = np.mean(plddt)
@@ -367,7 +435,12 @@ if __name__ == "__main__":
     parser.add_argument("--relax", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--save_raw_output", action="store_true")
-
+    parser.add_argument(
+    "--rdc_path",
+    type=str,
+    default=None,
+    help="Optional path to tab-delimited RDC file with columns: residue, atom1, atom2, value"
+)
     args = parser.parse_args()
 
     if args.model_device == "cpu" and torch.cuda.is_available():
